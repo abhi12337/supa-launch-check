@@ -215,7 +215,7 @@ RE_FUNCTION = re.compile(
     rf"^create\s+(?:or\s+replace\s+)?function\s+{_QNAME}\s*\(", re.I
 )
 RE_ALTER_FUNC_PATH = re.compile(
-    rf"^alter\s+function\s+{_QNAME}\s*(?:\([^)]*\))?\s+set\s+search_path", re.I | re.S
+    rf"^alter\s+function\s+{_QNAME}\s*(?:\([^)]*\))?\s+set\s+\"?search_path\b", re.I | re.S
 )
 RE_VIEW = re.compile(
     rf"^create\s+(?:or\s+replace\s+)?(?:temp\s+|temporary\s+)?(?:recursive\s+)?view\s+"
@@ -234,6 +234,15 @@ RE_BUCKET_UPDATE = re.compile(
 )
 
 PUBLIC_ROLES = {"public", "anon"}
+# Roles that bypass RLS or are never used by API clients: a `using (true)` policy for
+# them grants nothing that the role does not already have.
+PRIVILEGED_ROLES = {
+    "service_role", "postgres", "supabase_admin", "supabase_auth_admin",
+    "supabase_storage_admin", "supabase_realtime_admin", "dashboard_user",
+}
+RE_DROP_POLICY = re.compile(rf"^drop\s+policy\s+(?:if\s+exists\s+)?({_IDENT})\s+on\s+{_QNAME}", re.I)
+RE_DROP_FUNCTION = re.compile(rf"^drop\s+function\s+(?:if\s+exists\s+)?{_QNAME}", re.I)
+RE_DROP_VIEW = re.compile(rf"^drop\s+view\s+(?:if\s+exists\s+)?(.+?)(?:\s+(?:cascade|restrict))?$", re.I | re.S)
 
 
 def _policy_parts(rest: str) -> tuple[str, set[str], str | None, str | None, bool]:
@@ -269,10 +278,39 @@ def _strip_quotes(v: str) -> str:
     return v
 
 
+RE_DO_BLOCK = re.compile(r"^do\b", re.I)
+RE_LITERAL_ENABLE_RLS = re.compile(
+    rf"\balter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?{_QNAME}\s+enable\s+row\s+level\s+security\b", re.I
+)
+RE_DYNAMIC_ENABLE_RLS = re.compile(
+    r"alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?(?:\w+\.)?%[ILs]\s+enable\s+row\s+level\s+security", re.I
+)
+RE_ARRAY_LITERAL = re.compile(r"\barray\s*\[([^\]]*)\]", re.I)
+
+
+def _apply_do_block_rls(text: str, res: SqlResult) -> None:
+    """Follow RLS enabled inside `DO $$ ... $$` blocks.
+
+    Handles literal `alter table x enable row level security` statements and the common
+    loop `foreach t in array array['a','b'] loop execute format('alter table public.%I
+    enable row level security', t)`. Loops over catalog queries cannot be resolved
+    statically and are left alone.
+    """
+    names = [m.group(1) for m in RE_LITERAL_ENABLE_RLS.finditer(text)]
+    if RE_DYNAMIC_ENABLE_RLS.search(text):
+        for arr in RE_ARRAY_LITERAL.finditer(text):
+            names.extend(re.findall(r"'([A-Za-z_][A-Za-z0-9_$.]*)'", arr.group(1)))
+    for raw in names:
+        t = res.tables.get(norm_ident(raw))
+        if t is not None:
+            t.rls = True
+
+
 def scan_sql_files(paths: list[Path], root: Path) -> SqlResult:
     res = SqlResult()
     pending_defs: dict[str, Finding] = {}  # security definer funcs waiting for an ALTER fix
     pending_views: dict[str, Finding] = {}
+    pending_policies: dict[tuple[str, str], Finding] = {}  # (table, policy) -> open policy
 
     def rel(p: Path) -> str:
         try:
@@ -298,6 +336,10 @@ def scan_sql_files(paths: list[Path], root: Path) -> SqlResult:
                 res.tables[name] = TableState(name, st.file, st.line)
                 continue
 
+            if RE_DO_BLOCK.match(text):
+                _apply_do_block_rls(text, res)
+                continue
+
             if m := RE_ALTER_TABLE.match(text):
                 name = norm_ident(m.group(1))
                 rest = m.group(2).lower()
@@ -315,18 +357,39 @@ def scan_sql_files(paths: list[Path], root: Path) -> SqlResult:
                     new = f"{_schema(name)}.{norm_ident(rm.group(1)).split('.', 1)[1]}"
                     res.tables[new] = res.tables.pop(name)
                     res.tables[new].name = new
+                    for key in [k for k in pending_policies if k[0] == name]:  # policies follow
+                        f = pending_policies.pop(key)
+                        f.extra["table"] = new
+                        pending_policies[(new, key[1])] = f
                 continue
 
             if m := RE_DROP_TABLE.match(text):
                 for raw in _split_top(m.group(1)):
-                    res.tables.pop(norm_ident(raw), None)
+                    dropped = norm_ident(raw)
+                    res.tables.pop(dropped, None)
+                    for key in [k for k in pending_policies if k[0] == dropped]:
+                        del pending_policies[key]
+                continue
+
+            if m := RE_DROP_POLICY.match(text):
+                pending_policies.pop((norm_ident(m.group(2)), m.group(1).strip('"')), None)
+                continue
+
+            if m := RE_DROP_FUNCTION.match(text):
+                pending_defs.pop(norm_ident(m.group(1)), None)
+                continue
+
+            if m := RE_DROP_VIEW.match(text):
+                for raw in _split_top(m.group(1)):
+                    pending_views.pop(norm_ident(raw), None)
                 continue
 
             if m := RE_POLICY.match(text):
                 pname = m.group(1).strip('"')
                 table = norm_ident(m.group(2))
                 cmd, roles, using, check, restrictive = _policy_parts(m.group(3))
-                if restrictive:
+                pending_policies.pop((table, pname), None)
+                if restrictive or (roles and roles <= PRIVILEGED_ROLES):
                     continue
                 open_using = _is_true(using) and cmd in {"all", "select", "update", "delete"}
                 open_check = _is_true(check) and cmd in {"all", "insert", "update"}
@@ -345,7 +408,7 @@ def scan_sql_files(paths: list[Path], root: Path) -> SqlResult:
                 if open_check:
                     clause.append("with check (true)")
                 who = "anyone (anon)" if is_public else "any signed-in user"
-                res.findings.append(
+                pending_policies[(table, pname)] = (
                     Finding(
                         "SLC102",
                         sev,
@@ -363,7 +426,7 @@ def scan_sql_files(paths: list[Path], root: Path) -> SqlResult:
                 fname = norm_ident(m.group(1))
                 args = _signature(_balanced_after(text, m.end() - 1) or "")
                 if re.search(r"\bsecurity\s+definer\b", low_masked) and not re.search(
-                    r"\bset\s+search_path\b", low_masked
+                    r"\bset\s+\"?search_path\b", low_masked
                 ):
                     f = Finding(
                         "SLC104",
@@ -373,7 +436,11 @@ def scan_sql_files(paths: list[Path], root: Path) -> SqlResult:
                         st.line,
                         extra={"function": fname, "args": args},
                     )
-                    if _schema(fname) in EXPOSED_SCHEMAS:
+                    if re.search(r"\breturns\s+\"?(?:trigger|event_trigger)\b", low_masked):
+                        # Trigger functions cannot be invoked through /rpc; this is hardening only.
+                        f.severity = "low"
+                        f.message += " It is a trigger function, so it is not callable via /rpc (hardening only)."
+                    elif _schema(fname) in EXPOSED_SCHEMAS:
                         f.severity = "high"
                         f.message += " It is in an API-exposed schema, so it is callable via /rpc."
                     pending_defs[fname] = f
@@ -464,6 +531,7 @@ def scan_sql_files(paths: list[Path], root: Path) -> SqlResult:
                     extra={"table": t.name},
                 )
             )
+    res.findings.extend(pending_policies.values())
     res.findings.extend(pending_defs.values())
     res.findings.extend(pending_views.values())
     return res

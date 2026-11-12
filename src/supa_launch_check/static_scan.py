@@ -29,7 +29,10 @@ BINARY_EXT = {
 }
 CODE_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro"}
 BUILD_DIRS = {"dist", "build", "out", ".next", ".output", ".vercel", ".netlify", "public", "www"}
-SERVER_HINTS = ("supabase/functions/", "/api/", "/server/", "/backend/", "/functions/", "/lambda/")
+SERVER_HINTS = (
+    "supabase/functions/", "/api/", "/server/", "/backend/", "/functions/", "/lambda/",
+    "/jobs/", "/worker/", "/workers/", "/cron/",
+)
 ENV_SAFE_SUFFIXES = (".example", ".sample", ".template", ".dist", ".defaults")
 IGNORE_MARK = re.compile(r"supa-launch-check:\s*ignore", re.I)
 MAX_BYTES_DEFAULT = 10 * 1024 * 1024
@@ -100,10 +103,33 @@ class _Lines:
         return self.text[s:e]
 
 
+# Files that end in ".env" but are not dotenv secrets files: `.xcode.env` is the React
+# Native / Xcode build config (NODE_BINARY=...) that templates commit on purpose.
+NOT_ENV_FILES = {".xcode.env"}
+DOC_EXT = {".md", ".mdx", ".rst", ".txt"}
+# Next.js server actions / server-only modules never run in the browser.
+RE_SERVER_ONLY_FILE = re.compile(r"""^\s*['"]use server['"]|import\s+['"]server-only['"]""", re.M)
+RE_PLACEHOLDER = re.compile(r"(.)\1{5,}")  # 000000, xxxxxx, ...
+
+
 def _is_env_file(name: str) -> bool:
+    if name in NOT_ENV_FILES:
+        return False
     return (name == ".env" or name.startswith(".env.") or name.endswith(".env")) and not name.lower().endswith(
         ENV_SAFE_SUFFIXES
     )
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    """Real API keys are random: many distinct characters, no long runs of one character."""
+    body = re.sub(r"^(?:sk-(?:ant-|proj-|svcacct-|admin-|or-v1-)?|[sr]k_(?:live|test)_|sb_secret_|AKIA|ASIA|gh[pousr]_|github_pat_)",
+                  "", value)
+    return bool(RE_PLACEHOLDER.search(body)) or len(set(body)) < 12
+
+
+def _private_key_has_body(text: str, end: int) -> bool:
+    following = re.sub(r"\\n|\s", "", text[end : end + 200])  # real newlines and literal "\n"
+    return re.match(r"[A-Za-z0-9+/=]{64}", following) is not None
 
 
 def _is_server_path(rel: str) -> bool:
@@ -207,18 +233,63 @@ def _gitignore_covers(root: Path, rel: str) -> bool:
 
 
 # --- main scan ------------------------------------------------------------------
-def find_sql_files(root: Path, files: list[Path]) -> list[Path]:
-    mig = root / "supabase" / "migrations"
-    if mig.is_dir():
-        sql = sorted(p for p in mig.glob("*.sql") if p.is_file())
-        schemas = root / "supabase" / "schemas"
-        if schemas.is_dir():
-            sql = sorted(schemas.glob("*.sql")) + sql
-        return sql
-    return sorted(
+def _project_sql(supabase_dir: Path) -> list[Path]:
+    """Migrations in order, then declarative schemas, for one supabase/ folder.
+
+    With declarative schemas, `supabase/schemas` is the source of truth for the final
+    state and migrations are diffs generated from it, so the schemas are read last: their
+    definitions supersede what older migrations created (renamed tables, replaced
+    policies and functions)."""
+    sql = sorted(p for p in (supabase_dir / "migrations").glob("*.sql") if p.is_file())
+    schemas = supabase_dir / "schemas"
+    if schemas.is_dir():
+        sql = sql + sorted(schemas.glob("*.sql"))
+    return sql
+
+
+def find_sql_groups(root: Path, files: list[Path]) -> list[list[Path]]:
+    """Return SQL files grouped per Supabase project.
+
+    1. `supabase/migrations` at the root: one project.
+    2. Otherwise nested `**/supabase/migrations` folders (monorepos such as
+       `apps/web/supabase`, or collections of examples): one group per folder, scanned
+       independently so that tables from different projects never mask each other.
+    3. Otherwise every non-test `.sql` file in the repo, as one group.
+    """
+    if (root / "supabase" / "migrations").is_dir():
+        return [_project_sql(root / "supabase")]
+    nested: dict[Path, None] = {}
+    for p in files:
+        if p.suffix.lower() != ".sql" or p.parent.name != "migrations" or p.parent.parent.name != "supabase":
+            continue
+        if _is_test_path(p.relative_to(root).as_posix()):
+            continue
+        nested.setdefault(p.parent.parent, None)
+    if nested:
+        return [_project_sql(d) for d in sorted(nested, key=lambda d: d.relative_to(root).as_posix())]
+    return [sorted(
         (p for p in files if p.suffix.lower() == ".sql" and not _is_test_path(p.relative_to(root).as_posix())),
         key=lambda p: p.relative_to(root).as_posix(),
-    )
+    )]
+
+
+def find_sql_files(root: Path, files: list[Path]) -> list[Path]:
+    return [p for group in find_sql_groups(root, files) for p in group]
+
+
+def _scan_sql_groups(groups: list[list[Path]], root: Path) -> SqlResult:
+    merged = SqlResult()
+    for group in groups:
+        res = scan_sql_files(group, root)
+        merged.findings.extend(res.findings)
+        merged.files.extend(res.files)
+        for name, state in res.tables.items():
+            # A table name defined by several projects counts as protected only if every
+            # project that defines it enables RLS.
+            prev = merged.tables.get(name)
+            if prev is None or (prev.rls and not state.rls):
+                merged.tables[name] = state
+    return merged
 
 
 def scan_path(
@@ -234,8 +305,7 @@ def scan_path(
     files = iter_files(root, excludes)
 
     # SQL first, so client-side table access can be cross-checked.
-    sql_paths = find_sql_files(root, files)
-    sql = scan_sql_files(sql_paths, root)
+    sql = _scan_sql_groups(find_sql_groups(root, files), root)
     result.sql_files = sql.files
     result.findings.extend(sql.findings)
 
@@ -298,7 +368,13 @@ def scan_path(
             if not payload:
                 continue
             role = str(payload.get("role", ""))
-            if role == "service_role":
+            if role in ("service_role", "supabase_admin") and payload.get("iss") == "supabase-demo":
+                # The well-known key printed by `supabase start`. It is public and only works
+                # against local stacks (or a self-hosted stack left on the default JWT secret).
+                add_secret("SLC001", "low", m.group(0), m.start(),
+                           "Supabase local-dev demo service_role JWT (public, well-known; a risk only if a "
+                           "self-hosted stack still uses the default JWT secret)")
+            elif role == "service_role":
                 add_secret("SLC001", "high" if server and not build else "critical", m.group(0), m.start(),
                            "Supabase service_role JWT")
             elif role == "supabase_admin":
@@ -311,7 +387,15 @@ def scan_path(
         for sp in SECRET_PATTERNS:
             for m in sp.regex.finditer(text):
                 sev = sp.server_severity if server and not build else sp.severity
-                add_secret(sp.rule_id, sev, m.group(0), m.start(), sp.name)
+                label = sp.name
+                if sp.name == "Private key":
+                    # A PEM header in docs ("convert your -----BEGIN RSA PRIVATE KEY----- ...")
+                    # is not a key; require base64 key material after it in doc files.
+                    if path.suffix.lower() in DOC_EXT and not _private_key_has_body(text, m.end()):
+                        continue
+                elif _looks_like_placeholder(m.group(0)):
+                    sev, label = "low", f"{sp.name} (looks like a placeholder)"
+                add_secret(sp.rule_id, sev, m.group(0), m.start(), label)
 
         if not server:
             for m in RE_PUBLIC_SERVICE_VAR.finditer(text):
@@ -325,9 +409,16 @@ def scan_path(
                             evidence=m.group(0))
                 )
 
-        if path.suffix.lower() in CODE_EXT and not server:
+        # Only files that mention Supabase: `.from('x')` is also Array.from, color libraries,
+        # query builders, etc.
+        if (
+            path.suffix.lower() in CODE_EXT
+            and not server
+            and "supabase" in text.lower()
+            and not RE_SERVER_ONLY_FILE.search(text[:2000])
+        ):
             for m in RE_FROM_CALL.finditer(text):
-                before = text[max(0, m.start() - 20) : m.start()]
+                before = text[max(0, m.start() - 80) : m.start()]
                 if RE_FROM_EXCLUDE_BEFORE.search(before):
                     continue
                 ign, ln = ignored_at(m.start())

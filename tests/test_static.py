@@ -195,3 +195,104 @@ def test_clean_repo_is_clean(make_repo, fake):
     })
     shutil.copytree(FIX / "sql_clean" / "supabase", root / "supabase")
     assert scan(root) == []
+
+
+# ---------------------------------------------------------------- monorepos and demo keys
+def test_nested_supabase_migrations_are_scanned_per_project(make_repo):
+    root = make_repo({
+        "apps/a/supabase/migrations/001.sql": "create table todos (id int);",
+        "apps/b/supabase/migrations/001.sql": "create table todos (id int); alter table todos enable row level security;",
+        "apps/a/supabase/seed.sql": "create table seed_only (id int);",
+        "packages/other/schema.sql": "create table unrelated (id int);",
+    })
+    res, sql = scan_path(root)
+    assert sorted(res.sql_files) == ["apps/a/supabase/migrations/001.sql", "apps/b/supabase/migrations/001.sql"]
+    [f] = only(res.findings, "SLC101")
+    assert f.file == "apps/a/supabase/migrations/001.sql"
+    assert sql.rls_enabled("todos") is False  # unprotected in at least one project
+
+
+def test_local_demo_service_role_key_is_low(make_repo):
+    import base64, json as _json
+    def b64(o):
+        raw = o if isinstance(o, bytes) else _json.dumps(o).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    demo = ".".join([b64({"alg": "HS256", "typ": "JWT"}),
+                     b64({"iss": "supabase-demo", "role": "service_role", "exp": 1983812996}),
+                     b64(b"fake-signature-bytes-for-test")])
+    root = make_repo({"src/lib/local.ts": f'const k = "{demo}";'})
+    [f] = only(scan(root), "SLC001")
+    assert f.severity == "low"
+    assert "demo" in f.message
+
+
+# ---------------------------------------------------------------- false-positive guards
+def test_placeholder_api_key_is_low(make_repo):
+    placeholder = "sk-" + "or-v1-" + "0" * 40
+    root = make_repo({"src/settings.tsx": f'const placeholder = "{placeholder}";'})
+    [f] = only(scan(root), "SLC004")
+    assert f.severity == "low" and "placeholder" in f.message
+
+
+def test_real_looking_api_key_is_not_a_placeholder(make_repo, fake):
+    root = make_repo({"src/ai.ts": f'const k = "{fake["openai"]}";'})
+    [f] = only(scan(root), "SLC004")
+    assert f.severity == "critical"
+
+
+def test_pem_header_mentioned_in_docs_is_ignored(make_repo, fake):
+    root = make_repo({"README.md": f"If your key starts with `{fake['private_key']}`, convert it."})
+    assert only(scan(root), "SLC004") == []
+
+
+def test_pem_key_with_body_in_docs_is_reported(make_repo, fake):
+    body = "MIIEow" + "Ab9Zx3Kq" * 10
+    root = make_repo({"docs/setup.md": f"{fake['private_key']}\n{body}\n"})
+    assert len(only(scan(root), "SLC004")) == 1
+
+
+def test_xcode_env_is_not_a_dotenv_file(make_repo):
+    root = make_repo({"ios/.xcode.env": "export NODE_BINARY=$(command -v node)\n"}, git=True, add=["ios/.xcode.env"])
+    assert only(scan(root), "SLC005") == []
+
+
+def test_from_call_in_file_without_supabase_is_ignored(make_repo):
+    root = make_repo({
+        "supabase/migrations/001.sql": "create table todos (id int);",
+        "src/color.ts": "import tinycolor from 'tinycolor';\nconst c = colord.from('transparent');",
+    })
+    assert only(scan(root), "SLC006") == []
+
+
+def test_from_call_in_background_jobs_is_server_side(make_repo):
+    root = make_repo({
+        "supabase/migrations/001.sql": "create table todos (id int);",
+        "packages/jobs/src/sync.ts": "import { supabase } from './supabase';\nawait supabase.from('todos').select();",
+    })
+    assert only(scan(root), "SLC006") == []
+
+
+def test_from_call_in_server_action_is_ignored(make_repo):
+    root = make_repo({
+        "supabase/migrations/001.sql": "create table todos (id int);",
+        "app/actions/todos.ts": "'use server';\nimport { createClient } from '@/utils/supabase/server';\n"
+                                "export async function f(s) { return s.from('todos').select(); }",
+        "lib/admin.ts": "import 'server-only';\nconst supabase = admin();\nsupabase.from('todos').delete();",
+    })
+    assert only(scan(root), "SLC006") == []
+
+
+def test_declarative_schemas_are_read_after_migrations(make_repo):
+    root = make_repo({
+        "supabase/migrations/001.sql": "create table todos (id int);",
+        "supabase/schemas/01_todos.sql": "create table todos (id int); alter table todos enable row level security;",
+    })
+    res, _ = scan_path(root)
+    assert res.sql_files == ["supabase/migrations/001.sql", "supabase/schemas/01_todos.sql"]
+    assert only(res.findings, "SLC101") == []
+
+
+def test_multiline_storage_from_with_crlf_is_not_a_table(make_repo):
+    code = "const supabase = createClient();\r\nconst { error } = await supabase.storage\r\n            .from('audio')\r\n            .remove(paths);\r\n"
+    root = make_repo({"supabase/migrations/001.sql": "create table todos (id int);", "src/player.tsx": code})
+    assert only(scan(root), "SLC006") == []

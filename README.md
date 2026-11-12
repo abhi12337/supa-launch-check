@@ -145,10 +145,14 @@ minified files. `node_modules`, `.git`, binaries and test folders are skipped (u
 
 ### 2. Migration / SQL scan (part of `scan`)
 
-Reads `supabase/migrations/*.sql` in order (plus `supabase/schemas/*.sql` if you use
-declarative schemas; falls back to every `.sql` file in the repo if there is no
-`supabase/migrations`). It follows `alter table ... enable/disable row level security`,
-renames and drops across files, ignores comments, and does not look inside function bodies.
+Reads `supabase/migrations/*.sql` in order, then `supabase/schemas/*.sql` if you use
+declarative schemas (they describe the final state). In a monorepo without a root
+`supabase/` folder it scans every nested `**/supabase/migrations` folder as its own project,
+and falls back to every `.sql` file only if there is none. It follows
+`alter table ... enable/disable row level security` (including the common `DO $$ ... foreach
+... execute format('alter table %I enable row level security')` loop), renames, and dropped
+tables, policies, functions and views across files. It ignores comments and does not
+otherwise look inside function bodies.
 
 | Rule | Severity | What it finds |
 |---|---|---|

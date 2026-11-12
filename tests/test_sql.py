@@ -143,3 +143,124 @@ def test_function_signature_drops_defaults(tmp_path):
     [f] = scan_sql_files([p], tmp_path).findings
     assert f.extra["args"] == "a int, b text, out c int"
     assert "public.f(a int, b text, out c int)" in f.fix
+
+
+# ---------------------------------------------------------------- later migrations fix things
+def _scan_text(tmp_path, *sqls):
+    paths = []
+    for i, sql in enumerate(sqls):
+        p = tmp_path / f"{i:03d}.sql"
+        p.write_text(sql, encoding="utf-8")
+        paths.append(p)
+    return scan_sql_files(paths, tmp_path)
+
+
+def test_dropped_open_policy_is_not_reported(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        'create table t (id int); alter table t enable row level security;\n'
+        'create policy "open" on t for all using (true);',
+        'drop policy if exists "open" on public.t;\n'
+        'create policy "owner" on t for all using (auth.uid() = id);',
+    )
+    assert _by(res, "SLC102") == []
+
+
+def test_recreated_open_policy_is_reported_once(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        'create policy "p" on t for update using (true);',
+        'drop policy "p" on t; create policy "p" on t for update using (true);',
+    )
+    assert len(_by(res, "SLC102")) == 1
+
+
+def test_dropping_table_drops_its_policy_findings(tmp_path):
+    res = _scan_text(tmp_path, 'create policy "p" on t for delete using (true);', "drop table if exists t;")
+    assert _by(res, "SLC102") == []
+
+
+def test_service_role_only_policy_is_not_reported(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        'create policy "svc" on t for all to service_role using (true) with check (true);\n'
+        'create policy "mixed" on t for all to authenticated, service_role using (true);',
+    )
+    [f] = _by(res, "SLC102")
+    assert f.extra["policy"] == "mixed"
+
+
+def test_dropped_security_definer_function_and_view(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        "create function public.f() returns int language sql security definer as $$ select 1 $$;\n"
+        "create view public.v as select 1;",
+        "drop function if exists public.f(); drop view if exists public.v;",
+    )
+    assert _by(res, "SLC104") == [] and _by(res, "SLC105") == []
+
+
+def test_security_definer_trigger_function_is_low(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        "create function public.handle_new_user() returns trigger language plpgsql security definer "
+        "as $$ begin insert into public.profiles(id) values (new.id); return new; end $$;",
+    )
+    [f] = _by(res, "SLC104")
+    assert f.severity == "low" and "trigger" in f.message
+
+
+def test_rls_enabled_in_do_block_loop(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        "create table public.a (id int); create table public.b (id int); create table public.c (id int);\n"
+        "do $$ declare t text; begin\n"
+        "  foreach t in array array['a', 'b'] loop\n"
+        "    execute format('alter table public.%I enable row level security', t);\n"
+        "  end loop;\n"
+        "end $$;",
+        "do $x$ begin if true then alter table public.c enable row level security; end if; end $x$;",
+    )
+    assert _by(res, "SLC101") == []
+
+
+def test_do_block_without_rls_changes_nothing(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        "create table public.a (id int);\n"
+        "do $$ begin perform 1 from unnest(array['a']); end $$;",
+    )
+    assert len(_by(res, "SLC101")) == 1
+
+
+def test_quoted_trigger_return_type_is_low(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        'CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger" LANGUAGE "plpgsql" '
+        "SECURITY DEFINER AS $$ begin return new; end $$;",
+    )
+    [f] = _by(res, "SLC104")
+    assert f.severity == "low"
+
+
+def test_renamed_table_keeps_policy_and_replacement_supersedes_it(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        'create table "contactNotes" (id int); alter table "contactNotes" enable row level security;\n'
+        'create policy "upd" on "contactNotes" for update to authenticated using (true);',
+        'alter table "contactNotes" rename to contact_notes;',
+        'create policy "upd" on contact_notes for update to authenticated using (true);',
+    )
+    [f] = _by(res, "SLC102")
+    assert f.extra["table"] == "public.contact_notes"
+
+
+def test_quoted_search_path_counts_as_set(tmp_path):
+    res = _scan_text(
+        tmp_path,
+        'CREATE OR REPLACE FUNCTION "public"."is_admin"() RETURNS boolean LANGUAGE "plpgsql" SECURITY DEFINER '
+        "SET \"search_path\" TO '' AS $$ begin return true; end $$;\n"
+        'CREATE FUNCTION public.g() RETURNS int LANGUAGE sql SECURITY DEFINER AS $$ select 1 $$;\n'
+        'ALTER FUNCTION "public"."g"() SET "search_path" TO \'\';',
+    )
+    assert _by(res, "SLC104") == []
