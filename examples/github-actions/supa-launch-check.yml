@@ -1,0 +1,43 @@
+# Copy to .github/workflows/supa-launch-check.yml in YOUR app's repository.
+# Fails the build on Critical/High findings. Static scan only: no network calls,
+# no secrets needed.
+name: supa-launch-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install supa-launch-check
+        # Replace OWNER with the GitHub account that hosts supa-launch-check
+        # (pin a tag or commit SHA for reproducible builds).
+        run: pipx install git+https://github.com/OWNER/supa-launch-check@v0.1.0
+
+      # Optional: also scan the production bundle, where leaked keys actually end up.
+      # - run: npm ci && npm run build
+
+      - name: Scan repo (fails on critical/high)
+        run: supa-launch-check scan . --no-color --fail-on high
+
+      - name: JSON report artifact
+        if: always()
+        run: supa-launch-check scan . --json --fail-on never > supa-launch-check.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: supa-launch-check-report
+          path: supa-launch-check.json
