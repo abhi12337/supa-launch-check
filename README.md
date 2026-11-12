@@ -23,6 +23,7 @@ Zero dependencies (Python 3.10+ standard library only). Works offline. CI-friend
 ## Quick start
 
 ```bash
+pipx install git+https://github.com/abhi12337/supa-launch-check   # straight from GitHub
 pipx install .                      # from a clone of this repo (or: pip install .)
 
 supa-launch-check scan path/to/your-app          # source repo
