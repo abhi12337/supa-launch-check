@@ -336,4 +336,6 @@ MIT, Copyright (c) 2026 Abheesht Tripathi. See [LICENSE](LICENSE).
 
 ---
 
+**More open-source checks from the same author:** [mcp-audit](https://github.com/abhi12337/mcp-audit) · [rules-file-audit](https://github.com/abhi12337/rules-file-audit) · [inject-test](https://github.com/abhi12337/inject-test) · [firebase-launch-check](https://github.com/abhi12337/firebase-launch-check) · [key-leak-check](https://github.com/abhi12337/key-leak-check) · [route-auth-check](https://github.com/abhi12337/route-auth-check) · [webhook-check](https://github.com/abhi12337/webhook-check) · [llm-cost-lint](https://github.com/abhi12337/llm-cost-lint) · [pg-launch-check](https://github.com/abhi12337/pg-launch-check). Overview and research: [github.com/abhi12337](https://github.com/abhi12337)
+
 Need help fixing these before launch? abheeshttripathi890@gmail.com
